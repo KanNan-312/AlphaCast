@@ -1,3 +1,11 @@
+# Identifies and characterizes the exogenous variables Xex (paper Sec 3.1)
+# across the various dataset schemas. Each known "base" variable (wind
+# speed, load forecasts, transformer load components, etc.) may appear under
+# several raw column-naming conventions depending on the dataset; this module
+# normalizes those names, extracts the same Table-5 feature set per variable
+# (via extract_target_features), and ranks variables by correlation with the
+# target so the Investigator/Generator can focus on the Top-3 most relevant
+# exogenous drivers.
 from __future__ import annotations
 
 from typing import Dict, List, Tuple
@@ -8,6 +16,8 @@ import pandas as pd
 from .extract import extract_target_features
 
 
+# Maps a canonical exogenous variable name to the list of raw column-name
+# variants it may appear as across different dataset CSVs.
 EXOGENOUS_BASES: Dict[str, List[str]] = {
     "wind_speed_80m": ["wind_speed_80m", "ws_80m", "Wind speed 80m"],
     "wind_direction_80m": ["wind_direction_80m", "wd_80m", "Wind direction 80m"],
@@ -57,6 +67,10 @@ EXOGENOUS_BASES: Dict[str, List[str]] = {
 }
 
 
+# Human-readable descriptions surfaced to the LLM agents as part of the data
+# profile Idp, so they can reason about each exogenous variable's semantics
+# (e.g. for the Joule's-law / mass-conservation style reasoning in the
+# Appendix B.4 case studies).
 EXOGENOUS_DESCRIPTIONS: Dict[str, str] = {
     "wind_speed_80m": "80-meter wind speed meteorological series (m/s).",
     "wind_direction_80m": "80-meter wind direction (degrees from north).",
@@ -83,6 +97,9 @@ def _normalize_name(s: str) -> str:
 
 
 def _find_station_columns(df: pd.DataFrame, base_names: List[str]) -> List[str]:
+    """Find all columns in `df` matching any of `base_names`, including
+    multi-station variants (e.g. `wind_speed_80m_station1/2/3`), so readings
+    from multiple stations can be averaged into one exogenous series."""
     # Build normalized lookup for dataframe columns
     cols_orig = list(df.columns)
     cols_norm = [_normalize_name(c) for c in cols_orig]
@@ -194,7 +211,9 @@ def extract_exogenous_features(
         corr = _pearson_corr(exo_series, y)
         corr_by_var[var_name] = float(corr)
 
-    # Select Top-3 by absolute correlation (or fewer if not enough variables available)
+    # Select Top-3 by absolute correlation (or fewer if not enough variables
+    # available). These are the default exogenous_vars surfaced to the
+    # Generator when the agent does not explicitly choose its own selection.
     ordered = sorted(
         [(k, v) for k, v in corr_by_var.items() if np.isfinite(v)],
         key=lambda kv: abs(kv[1]),

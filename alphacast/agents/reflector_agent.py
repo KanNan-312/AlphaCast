@@ -1,3 +1,19 @@
+# ReflectorAgent: Stage 3 of the pipeline (paper Sec 3.6, Algorithm 2's
+# EVALUATE step). Like the InvestigatorAgent, it is backed by a
+# FunctionModel rather than a real LLM call -- it deterministically combines
+# two checks on the Generator's intermediate prediction Yint and reasoning
+# trace:
+#   1. assess_forecast (alphacast/agents/common.py): structural/plausibility
+#      sanity check (length, deviation from Ycase baseline, exogenous
+#      coverage, non-empty chain-of-thought).
+#   2. scan_chain_of_thought (this module): audits the chain-of-thought text
+#      for hallucinated/unsupported numeric claims, horizon-size
+#      contradictions, and baseline-statistic contradictions, by
+#      cross-referencing every number mentioned against the numeric values
+#      actually present in Icon and Yint.
+# The combined {approved, issues, notes, diagnostics} result is the feedback
+# `fb` returned by EVALUATE(Icon, Yint); GeneratorAgent.emit_predictions
+# raises on `approved=False` so the agent loop retries GENERATE (UPDATE).
 from __future__ import annotations
 
 import json
@@ -13,6 +29,8 @@ from pydantic_ai.models.function import FunctionModel  # type: ignore
 from .prompts import get_agent_instructions
 
 
+# Hardcoded fallback instructions (unused at runtime, see note in
+# investigator_agent.py about FunctionModel-backed agents).
 REFLECTOR_AGENT_PROMPT_FALLBACK = dedent(
     """
     You are ReflectorAgent. Audit each GeneratorAgent forecast by calling `assess_forecast` once and `scan_chain_of_thought` once.
@@ -34,6 +52,15 @@ _BASELINE_CLAIM_PATTERN = re.compile(
 )
 
 
+# --- Numeric-claim audit helpers -------------------------------------------
+# These build a "context" of every numeric value that legitimately appears in
+# Yint or Icon (predictions, reference_prediction/Ycase, predicted_window,
+# window_offset, and any number nested in the investor packet), then check
+# whether each number the LLM mentions in its chain-of-thought is close to
+# one of those values (within a relative tolerance). Numbers with no match
+# are flagged as "unsupported" -- potential hallucinations.
+
+
 def _safe_float(value: Any) -> float | None:
     try:
         val = float(value)
@@ -45,6 +72,8 @@ def _safe_float(value: Any) -> float | None:
 
 
 def _summarize_series(values: List[float]) -> List[float]:
+    """Reduce a numeric series to [first, last, min, max, mean] -- the
+    summary statistics an LLM is likely to cite when describing a series."""
     clean = [_safe_float(v) for v in values]
     clean = [c for c in clean if c is not None]
     if not clean:
@@ -66,6 +95,11 @@ def _collect_numeric_context(
     predicted_window: int,
     window_offset: int,
 ) -> List[float]:
+    """Build the pool of "grounded" numeric values: Yint itself,
+    predicted_window/window_offset, summary stats of reference_prediction
+    (Ycase) and of (Yint - Ycase) deviations, plus every numeric leaf found
+    anywhere in Icon (recursively). This is the reference set that
+    `_is_supported_numeric_claim` checks chain-of-thought numbers against."""
     context: List[float] = []
 
     for value in predictions:
@@ -137,6 +171,9 @@ def _collect_numeric_context(
 
 
 def _looks_like_date_fragment(text: str, start: int, end: int) -> bool:
+    """Heuristically exclude numbers that are actually part of a date or
+    timestamp (e.g. "2024-01-15" or "12:30") so they aren't flagged as
+    unsupported numeric claims."""
     before = text[start - 1 : start] if start > 0 else ""
     after = text[end : end + 1] if end < len(text) else ""
     after_next_digit = end + 1 < len(text) and text[end + 1].isdigit()
@@ -153,6 +190,10 @@ def _looks_like_date_fragment(text: str, start: int, end: int) -> bool:
 
 
 def _extract_numbers_from_text(text: str) -> List[Dict[str, Any]]:
+    """Extract every plausible numeric token from `text` (chain-of-thought),
+    excluding date/timestamp fragments, with its raw string, parsed value,
+    whether it's a percentage, and its character span (for snippet
+    extraction)."""
     results: List[Dict[str, Any]] = []
     if not text:
         return results
@@ -180,6 +221,9 @@ def _extract_numbers_from_text(text: str) -> List[Dict[str, Any]]:
 
 
 def _is_supported_numeric_claim(value: float, context_numbers: List[float]) -> bool:
+    """True if `value` is within a relative tolerance of some number in
+    `context_numbers` (Yint/Icon), i.e. the LLM's claim is grounded in data
+    it actually had access to."""
     if not context_numbers:
         return False
     for ctx in context_numbers:
@@ -196,6 +240,14 @@ def scan_chain_of_thought(
     chain_of_thought: str,
     window_offset: int,
 ) -> Dict[str, Any]:
+    """Audit the Generator's chain-of-thought text for three failure modes:
+    (1) numeric claims not grounded in Yint/Icon ("unsupported_numbers"),
+    (2) statements about the forecast horizon that contradict
+    `predicted_window` ("window_claim_mismatches"), and (3) statements about
+    the baseline (Ycase) mean/last value that contradict
+    `reference_prediction` ("baseline_claim_mismatches"). Sets
+    `flagged=True` if any are found; used by create_reflector_agent to add
+    `issues` and force `approved=False`."""
     analysis: Dict[str, Any] = {
         "total_numbers": 0,
         "unsupported_numbers": [],
@@ -332,9 +384,18 @@ def create_reflector_agent(
     assess_forecast: Callable[[List[float], int, Dict[str, Any], str], Dict[str, Any]],
     json_default: Callable[[Any], Any],
 ) -> Agent:
+    """Build the ReflectorAgent as a FunctionModel-backed Agent. Its single
+    "response" to any request is the EVALUATE(Icon, Yint) verdict: runs
+    `assess_forecast` (structural/plausibility checks) and
+    `scan_chain_of_thought` (reasoning-trace audit), merges their issues, and
+    returns {approved, issues, notes, diagnostics} as JSON."""
     instructions = get_agent_instructions("ReflectorAgent", REFLECTOR_AGENT_PROMPT_FALLBACK)
 
     def _extract_json_request(messages: list[Any]) -> dict[str, Any]:
+        """Find the most recent message part whose content parses as JSON --
+        this is the {predictions, predicted_window, investor_packet,
+        chain_of_thought, window_offset} request sent by
+        GeneratorAgent.emit_predictions."""
         for message in reversed(messages):
             parts = getattr(message, "parts", [])
             for part in reversed(parts):
@@ -347,6 +408,10 @@ def create_reflector_agent(
         return {}
 
     def _reflector_model(messages, agent_info) -> ModelResponse:
+        """The FunctionModel's "model" implementation: parses the request,
+        runs both audits, merges any chain-of-thought issues into the
+        assess_forecast report (forcing approved=False if any are found),
+        and wraps the combined report as a JSON text response."""
         payload = _extract_json_request(messages)
         raw_predictions = payload.get("predictions") or []
         predictions: List[float] = []

@@ -1,3 +1,19 @@
+# Core, non-LLM implementation of the AlphaCast toolkit and pipeline stages
+# (Algorithm 2 in the paper's Appendix B.6):
+#   - prepare_investor_packet: Stage-1 context extraction. Assembles the
+#     consolidated context Icon = (Iin, Fsel, K, E, Ycase, Xnb, Ynb) for the
+#     current look-back window. This is the function the InvestigatorAgent's
+#     `consult` tool calls.
+#   - assess_forecast: part of Stage-3 reflective evaluation. Implements the
+#     "Sanity Check" / EVALUATE(Icon, Yint) step that the ReflectorAgent's
+#     `assess_forecast` tool calls to decide approve vs. request refinement.
+#   - deterministic_run_for_dataset: the training-free, LLM-free fallback
+#     pipeline used when no LLM backbone is configured (build_agent_or_none
+#     returns None). It runs Stage-1 analysis, then GENERATE via similarity-
+#     based model selection only (no reasoning/reflection).
+#
+# NOTE: 'castmind' is a stale package name from an earlier project rename
+# (castagent -> castmind -> alphacast); see CLAUDE.md for details.
 from __future__ import annotations
 
 import json
@@ -56,7 +72,14 @@ def prepare_investor_packet(
     window_offset: int = 0,
     forecast_horizon: Optional[int] = None,
 ) -> dict:
-    """Generate the InvestigatorAgent research packet for a dataset window."""
+    """Generate the InvestigatorAgent research packet for a dataset window.
+
+    Builds Icon for the sliding-window step at `window_offset`: the raw
+    look-back window Xen/T (Iin), cached temporal features (candidates for
+    Fsel), exogenous variable slices/metadata (Xex, E), the case-based
+    reference prediction Ycase, and the nearest-neighbor pair (Xnb, Ynb).
+    See Table 8 in the paper for the notation <-> field-name mapping.
+    """
 
     dataset_name = ds_cfg.name
     ds_out_dir = os.path.join(cfg.output_dir, dataset_name) if cfg else os.path.join("outputs", dataset_name)
@@ -68,8 +91,14 @@ def prepare_investor_packet(
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
 
+    # Log of recommended/reference models for previous windows (debugging /
+    # case-study analysis); appended to below and rewritten at the end.
     basemodel_results = _read_json("basemodel_results.json") or []
 
+    # Artifacts produced by analyze_training() / deterministic_run_for_dataset()
+    # during Stage-1 precomputation: series stats, the feature set F, exogenous
+    # feature/correlation summaries, and the case library (case base, case
+    # neighbors, and cluster centers cm).
     memory = _read_json("memory.json") or {}
     features = _read_json("features.json") or {}
     exo_features = _read_json("exogenous_features.json") or {}
@@ -97,6 +126,11 @@ def prepare_investor_packet(
     lookback_end = offset + look_back
     test_target = test_df[target_col].to_numpy(dtype=float)
 
+    # Select the endogenous look-back window Xen for this step: normally the
+    # `look_back` points of the test series ending at `lookback_end` (the
+    # sliding-window backtest position); if the offset runs past the test
+    # set, fall back to the tail of the training series (covers the very
+    # first window before any test-set history is available).
     if test_len >= lookback_end:
         window_source = "test"
         window_vals = test_target[offset:lookback_end]
@@ -120,6 +154,14 @@ def prepare_investor_packet(
     if ref_horizon <= 0:
         ref_horizon = int(ds_cfg.predicted_window)
 
+    # --- Compute the case-based reference prediction Ycase (paper Eq. 2) ---
+    # Priority order:
+    #   1. An explicit `sel_model` override from the experiment config.
+    #   2. The nearest cluster Cm's weighted ensemble of candidate models
+    #      (the direct implementation of Eq. 2: average predictions of the
+    #      models in Cm, weighted by how often each was the per-window best).
+    #   3. The single best-matching case's model, via case-base similarity.
+    #   4. A hardcoded list of generic statistical models as a last resort.
     recommended_model = None
     best_model = None
     reference_prediction = None
@@ -155,6 +197,8 @@ def prepare_investor_packet(
             ]
             clusters = [c for c in clusters if c.window and c.best_model]
             if clusters:
+                # Nearest cluster center cm to Xen (Sec 3.4); blend its
+                # member models' forecasts weighted by their vote counts.
                 best_cluster = choose_cluster_by_similarity(clusters, np.asarray(window_vals, dtype=float))
                 best_model, total_weight = best_cluster.best_model, best_cluster.total_weight
                 for model_name in best_model:
@@ -177,6 +221,8 @@ def prepare_investor_packet(
             pass
 
     if not reference_prediction:
+        # Fall back to a single model chosen via nearest-case similarity
+        # (Sec 3.4, "outputs from the models in the selected cluster Cm").
         if case_base_raw:
             try:
                 cases = [
@@ -232,6 +278,9 @@ def prepare_investor_packet(
         if reference_prediction is None and primary_exc is not None:
             raise primary_exc
 
+    # --- Nearest-neighbor retrieval (Xnb, Ynb), Sec 3.4 ---
+    # Used by the Generator to adjust Ycase for scale/fluctuation differences
+    # between the retrieved neighbor and the current window (Sec 3.5).
     neighbor_lookback = None
     neighbor_pred = None
     if case_neighbor_raw:
@@ -253,6 +302,12 @@ def prepare_investor_packet(
             neighbor_lookback = None
             neighbor_pred = None
 
+    # --- Exogenous variable (Xex) discovery and slicing ---
+    # Builds, for each known exogenous variable, the source column(s),
+    # human-readable description, and the values covering both the look-back
+    # window (length H) and the forecast horizon (length L), implementing
+    # Xex in R^{(d-1) x (H+L)} from paper Sec 3.1 (future exogenous values are
+    # legitimate inputs; only the endogenous future is restricted).
     def _sanitize_exo_key(name: str) -> str:
         cleaned = re.sub(r"[^a-z0-9]+", "_", str(name).strip().lower())
         return cleaned.strip("_")
@@ -429,6 +484,13 @@ def prepare_investor_packet(
     with open(os.path.join(ds_out_dir, "basemodel_results.json"), "w", encoding="utf-8") as f:
         json.dump(basemodel_results, f, indent=2)
 
+    # Assemble Icon. Key fields and their paper notation (Table 8):
+    #   look_back_window/look_back_timestamps -> Xen, T
+    #   features / exogenous_features          -> candidate Fsel values
+    #   exogenous_*                             -> Xex, E (contextual pool)
+    #   reference_prediction                    -> Ycase
+    #   neighbor_lookback / neighbor_pred       -> Xnb, Ynb
+    #   dataset_briefing                        -> part of S (contextual pool)
     return {
         "dataset": dataset_name,
         "look_back_length": look_back,
@@ -472,6 +534,17 @@ def assess_forecast(
     investor_packet: dict[str, Any],
     chain_of_thought: str,
 ) -> dict[str, Any]:
+    """Sanity-check the Generator's intermediate prediction Yint and its
+    logged reasoning, implementing the "Sanity Check" portion of Stage-3
+    (paper Sec 3.6 / Appendix B.8.3 / Algorithm 2's EVALUATE step).
+
+    Checks: (1) `predictions` has exactly `predicted_window` (= L) entries,
+    (2) deviation from the baseline `reference_prediction` (Ycase) is
+    reported for the LLM to judge plausibility, (3) the forecast window's
+    exogenous coverage has no unflagged gaps, and (4) a non-empty
+    chain-of-thought was recorded (required for the reasoning-trace
+    evaluation). `approved=False` plus non-empty `issues` corresponds to the
+    feedback `fb` that triggers another GENERATE iteration."""
     issues: List[str] = []
     notes: List[str] = []
 
@@ -511,11 +584,24 @@ def assess_forecast(
 
 
 def deterministic_run_for_dataset(cfg: ExperimentConfig, ds) -> dict:
+    """Training-free, LLM-free fallback pipeline used when build_agent_or_none
+    returns None (no LLM backbone configured). It runs the Stage-1
+    precomputation (analyze_training: Case Library, clusters, features,
+    exogenous data -- Sec 3.3-3.5/Appendix A.2/B.2) and then a *simplified*
+    GENERATE step: pick a single candidate model via
+    choose_model_by_similarity/choose_neighbor_by_similarity (Eq. 2's nearest
+    case, without the cluster-weighted Ycase blending used by
+    prepare_investor_packet) and forecast directly with it. There is no
+    Stage-3 reflection loop (Algorithm 2's EVALUATE/UPDATE steps are skipped),
+    so this corresponds to the paper's "w/o Reasoning" backbone-only ablation
+    rather than the full agentic pipeline."""
     # Load training data
     data = pd.read_csv(ds.training_csv)
     data[TIME_COL] = pd.to_datetime(data[TIME_COL])
     data = data.sort_values(TIME_COL).reset_index(drop=True)
 
+    # Stage-1 precomputation: builds/refreshes memory.json, case_base.json,
+    # case_neighbor.json, cluster_base.json, etc. (see tools/analysis.py).
     _ = analyze_training(
         data,
         ds.look_back,
@@ -534,17 +620,26 @@ def deterministic_run_for_dataset(cfg: ExperimentConfig, ds) -> dict:
 
     target_col = infer_target_column(data, ds.name)
     y = data[target_col].to_numpy(dtype=float)
+    # Xen: the most recent look-back window, used for both model selection
+    # and as the input the chosen model is fit/forecast on.
     current_window = y[-ds.look_back :]
     current_ts_window = data[TIME_COL].iloc[-ds.look_back:]
 
+    # Case Library (Sec 3.3): (window, best_model) pairs used by
+    # choose_model_by_similarity to find the nearest case's Mi.
     with open(case_base_path, "r", encoding="utf-8") as f:
         raw_cases = json.load(f)
     cases = [CaseEntry(window=c["window"], best_model=c["best_model"]) for c in raw_cases]
 
+    # Case neighbors (Sec 3.4/3.5): (Xnb, Ynb) pairs used by
+    # choose_neighbor_by_similarity to find the nearest-neighbor look-back/
+    # prediction pair for the current window.
     with open(case_neighbor_path, "r", encoding="utf-8") as f:
         raw_neighbors = json.load(f)
     cases_neighbors = [CaseNeighbor(look_back_window=c["look_back_window"], pred_window=c["pred_window"]) for c in raw_neighbors]
 
+    # Fsel: optional temporal features (Table 5), persisted for diagnostics
+    # and possible feature-based model overrides below.
     feats = {}
     sel_cfg = getattr(cfg, "feature_selection_override", None)
     if getattr(cfg, "use_features", True):
@@ -558,6 +653,9 @@ def deterministic_run_for_dataset(cfg: ExperimentConfig, ds) -> dict:
         except Exception:
             pass
 
+    # Xex (Sec 3.1): exogenous variable features/correlations, persisted for
+    # diagnostics. Not used for model selection below -- the deterministic
+    # fallback chooses a model from the endogenous case library/neighbors only.
     if getattr(cfg, "use_exogenous", False):
         try:
             (
@@ -579,12 +677,22 @@ def deterministic_run_for_dataset(cfg: ExperimentConfig, ds) -> dict:
         except Exception:
             pass
 
+    # Simplified GENERATE step (Eq. 2 without cluster blending): pick the
+    # single candidate model Mi attached to the most similar case to Xen.
+    # neighbor_lookback/neighbor_pred (Xnb, Ynb) are computed for parity with
+    # the LLM pipeline's context but are not otherwise used here.
     pre_model = choose_model_by_similarity(cases, current_window)
     neighbor_lookback, neighbor_pred = choose_neighbor_by_similarity(cases_neighbors, current_window)
     config_sel_model = getattr(cfg, "sel_model", None)
     model_name = config_sel_model or pre_model
     override_reason = None
     seas_val = None
+    # Model-selection override priority: (1) cfg.sel_model forces a fixed
+    # model for every dataset/window, (2) feature_selection_override.force_model
+    # forces a fixed model for this dataset, (3) if
+    # prefer_seasonal_naive_if_seasonal is set and the series is strongly
+    # seasonal (seasonal_strength >= 0.6), switch to SeasonalNaive, otherwise
+    # (4) keep the similarity-recommended `pre_model`.
     if config_sel_model:
         override_reason = "sel_model"
     elif getattr(cfg, "use_features", True):
@@ -619,6 +727,9 @@ def deterministic_run_for_dataset(cfg: ExperimentConfig, ds) -> dict:
     else:
         print(f"[info] Model selection: similarity suggested={model_name}")
 
+    # Mi(Xen): fit the chosen model on the look-back window and forecast L
+    # steps ahead -- this is the final Y^ for the deterministic fallback
+    # (no Stage-3 reflection refines it further).
     preds = forecast_with_model(
         model_name,
         current_window,
@@ -640,6 +751,8 @@ def deterministic_run_for_dataset(cfg: ExperimentConfig, ds) -> dict:
     timestamps = generate_future_timestamps(pd.Timestamp(last_ts), ds.predicted_window, _mem_freq)
     save_predictions_csv(out_csv, timestamps, preds)
 
+    # Score Y^ against ground truth (Table 1 metrics) by re-reading the CSV
+    # we just wrote and aligning it to the test split via timestamps.
     test_df = pd.read_csv(ds.test_csv)
     test_df[TIME_COL] = pd.to_datetime(test_df[TIME_COL])
     pred_df = pd.read_csv(out_csv)

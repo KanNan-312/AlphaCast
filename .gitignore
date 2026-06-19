@@ -64,3 +64,5 @@ castagent/foundation_models/
 
 # Python version managers
 .python-version
+
+CLAUDE.md

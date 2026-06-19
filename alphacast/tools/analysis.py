@@ -1,4 +1,17 @@
-# castmind/tools/analysis.py
+# alphacast/tools/analysis.py
+#
+# Builds the offline "Case Library" toolkit component described in paper
+# Sec 3.3 / Appendix A.2 and B.2: it slides a (look_back, predicted_window)
+# window across the training series, finds which candidate model Mi from the
+# model pool (alphacast/models/base.py) forecasts each window best, and
+# records (window, best_model) pairs as the case base. These cases are then
+# clustered (via K-Medoids, in place of the paper's K-means) into cluster
+# centers cm used for fast retrieval at inference time.
+#
+# NOTE on notation: the paper uses Xen in R^H for the look-back window and L
+# for the forecast horizon. In this module the local variable names are
+# swapped: `L` is the look-back length (paper's H) and `H` is the horizon
+# (paper's L). Keep this in mind when comparing to the paper's equations.
 from __future__ import annotations
 import json, os
 from dataclasses import dataclass
@@ -20,6 +33,9 @@ from ..utils.time import AnalysisMemory, CaseEntry, ClusterEntry, CaseNeighbor, 
 
 @dataclass
 class AnalyzeResult:
+    """Output of `analyze_training`: the cached series statistics plus the
+    raw case base (per-window best model) and case neighbors (per-window
+    look-back/prediction pairs) used for retrieval during inference."""
     memory: AnalysisMemory
     case_base: List[CaseEntry]
     case_neighbors: List[CaseNeighbor]
@@ -31,6 +47,10 @@ def sliding_windows(
     H: int,
     step: Optional[int] = None,
 ) -> List[Tuple[np.ndarray, np.ndarray, pd.Series, pd.Series]]:
+    """Slice `y` into (look-back, future) pairs of lengths (L, H), each with
+    its corresponding timestamps, stepping by `step` (default: non-overlapping
+    windows of size L+H). Used both to build the case library from training
+    data and, in run_experiment.py, to backtest across the test set."""
     out: List[Tuple[np.ndarray, np.ndarray, pd.Series, pd.Series]] = []
     stride = int(step) if step and step > 0 else (L + H)  # Default: no overlap
     max_start = len(y) - (L + H)
@@ -52,6 +72,10 @@ def evaluate_models_on_window(
     ts_fut: pd.Series,
     season_length: Optional[int],
 ) -> Tuple[str, float]:
+    """Fit every candidate model Mi in the pool on look-back window `x` and
+    score it against the true future `fut` by MSE, returning the name of the
+    best-performing model. This is how each case (Xi, Yi) is paired with its
+    optimal candidate model Mi (paper Appendix B.2)."""
     best_name, best_err = "SeasonalNaive", float("inf")
     for m in models:
         try:
@@ -78,6 +102,13 @@ def analyze_training(
     num_clusters: Optional[int] = 6,
     dataset_cfg: Optional[DatasetConfig] = None,
 ) -> AnalyzeResult:
+    """Run the one-time, offline analysis pass over a dataset's training
+    series: compute summary statistics (`memory`), build the case library by
+    evaluating every candidate model on each sliding window, cluster the
+    cases with K-Medoids, and persist everything under
+    outputs/<dataset_name>/ as JSON (memory.json, case_base.json,
+    case_neighbor.json, cluster_base.json, cases_stats.json) so the
+    Investigator can retrieve from them without recomputation."""
     target_col = infer_target_column(train_df, dataset_name)
     y = train_df[target_col].to_numpy(dtype=float)
     ts_all = pd.to_datetime(train_df[TIME_COL])
@@ -113,11 +144,18 @@ def analyze_training(
     for x, fut, ts_x, ts_fut in sliding_windows(y, ts_all, L, H, step=stride):
         if len(x) < L or len(fut) < H: continue
         best_model, _ = evaluate_models_on_window(models, x, fut, ts_x, ts_fut, season_length=memory["periodicity_lag"])
+        # Case library entry: z-scored look-back window paired with the
+        # model Mi that best forecast it (paper Sec 3.3 "Case Library").
         cases.append(CaseEntry(window=zscore(x).tolist(), best_model=best_model))
         cases_stats.setdefault(best_model, 0)
         cases_stats[best_model] += 1
+        # Case neighbor entry: raw (Xi, Yi) pair retrievable as (Xnb, Ynb)
+        # for the Generator's neighbor-based adjustment (Sec 3.5).
         cases_neighbors.append(CaseNeighbor(look_back_window=x.tolist(), pred_window=fut.tolist()))
-    
+
+    # Group the case base into cluster centers cm (Sec 3.4) so the
+    # Investigator can find the nearest cluster to Xen via Euclidean
+    # distance instead of scanning every individual case.
     kmedoid_clusters = cluster_by_kmedoid(cases, method=method, num_clusters=num_clusters)
     clusters.extend(kmedoid_clusters)
 
@@ -143,16 +181,24 @@ def analyze_training(
     return result
 
 def choose_model_by_similarity(cases: List[CaseEntry], current_window: np.ndarray) -> str:
+    """Retrieve the candidate model Mi associated with the case whose
+    look-back window is most similar to `current_window` (Sec 3.4); its
+    forecast becomes (or contributes to) the case-based prediction Ycase."""
     candidates = [(np.asarray(c.window, dtype=float), c.best_model) for c in cases]
     model_name, _ = top1_most_similar(zscore(current_window), candidates)
     return model_name
 
 def choose_neighbor_by_similarity(cases: List[CaseNeighbor], current_window: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Retrieve the nearest-neighbor (Xnb, Ynb) pair for `current_window`,
+    used by the Generator to adjust for distribution shift (Sec 3.5)."""
     candidates = [(np.asarray(c.look_back_window, dtype=float), np.asarray(c.pred_window, dtype=float)) for c in cases]
     neighbor_lookback, neighbor_pred = top1_most_similar_neighbor(current_window, candidates)
     return neighbor_lookback, neighbor_pred
 
 def choose_cluster_by_similarity(clusters: List[ClusterEntry], current_window: np.ndarray) -> ClusterEntry:
+    """Retrieve the cluster Cm whose center cm is nearest to
+    `current_window` (Sec 3.4); its weighted `best_model` map drives the
+    averaged case-based prediction Ycase (Eq. 2)."""
     candidates = [c for c in clusters if c.window]
     best_cluster = top1_most_similar_cluster(zscore(current_window), candidates)
     return best_cluster
@@ -165,6 +211,19 @@ def cluster_by_kmedoid(
 ) -> List[ClusterEntry]:
     """
     Cluster cases with K-Medoids and return the medoid CaseEntry objects.
+
+    This plays the role of the K-means clustering described in paper
+    Appendix A.2 ("grouping training samples Xi into multiple clusters Cm").
+    K-Medoids is used instead of K-means because medoids are real case
+    windows (so their associated `best_model` votes remain meaningful), and
+    because pyclustering's K-Medoids supports arbitrary distance metrics.
+
+    `method` controls how each cluster center's `best_model` map (used to
+    average Ycase per Eq. 2) is populated:
+      - "voting":   the single most common best-model in the cluster gets weight 1.
+      - "weighted": every model that was best for >3 cases in the cluster
+                     keeps its vote count as a weight, so Ycase can blend
+                     multiple candidate models' predictions.
     """
     if not cases:
         return []
@@ -174,7 +233,7 @@ def cluster_by_kmedoid(
 
     # Convert NumPy arrays to Python lists for pyclustering compatibility
     window_vectors = [c.window.tolist() if hasattr(c.window, 'tolist') else list(c.window) for c in cases]
-    
+
     # Run pyclustering's K-Medoids implementation.
     # Note: pyclustering does not support cosine distance, so we use Euclidean distance.
     import random
@@ -182,13 +241,14 @@ def cluster_by_kmedoid(
     initial_medoids = random.sample(range(len(cases)), k)
     kmedoids_instance = kmedoids(window_vectors, initial_medoids, ccore=False)
     kmedoids_instance.process()
-    
+
     # Retrieve clustering results
     clusters = kmedoids_instance.get_clusters()
     medoid_indices = kmedoids_instance.get_medoids()
 
+    # Each cluster center cm is represented by its medoid's window vector.
     centers: List[ClusterEntry] = [ClusterEntry(window=cases[i].window, best_model={}, total_weight=0) for i in medoid_indices]
-    
+
     if method == "voting":
         # Assign each center the most frequent model label within its cluster
         for gi, medoid_idx in enumerate(medoid_indices):

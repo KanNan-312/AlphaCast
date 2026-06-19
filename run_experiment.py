@@ -1,3 +1,18 @@
+# Top-level experiment runner: for each configured dataset, this implements
+# the full pipeline of Algorithm 2 (Appendix B.6) end-to-end --
+#   Stage 1 (analyze_training/extract_target_features/extract_exogenous_features):
+#     precompute the Case Library, clusters, Fsel candidates, and Xex/E
+#     context that prepare_investor_packet later assembles into Icon per
+#     window.
+#   Stage 2/3 (agent.run_sync loop below): for each sliding-window step,
+#     instruct the GeneratorAgent to consult -> reason -> record_chain_of_thought
+#     -> emit_predictions, with emit_predictions internally running the
+#     Reflector's EVALUATE/UPDATE loop (Stage 3).
+#   Fallback: if no LLM backbone is configured (build_agent_or_none returns
+#     None) or the LLM path fails, deterministic_run_for_dataset provides the
+#     training-free "w/o Reasoning" baseline for that dataset.
+# Results across datasets are collected into the summary table (Table 1
+# columns: MSE, MAE, sMAPE per dataset/model).
 from __future__ import annotations
 
 import json
@@ -26,6 +41,9 @@ from alphacast.features import extract_target_features, extract_exogenous_featur
 
 
 def _load_dataset_brief(path: Optional[str]) -> str:
+    """Read a dataset's context_prompt_file (part of the contextual pool S,
+    Sec 3.2) into a string, returning "" if the dataset has none configured
+    or the file is missing."""
     if not path:
         return ""
     try:
@@ -39,6 +57,10 @@ def _load_dataset_brief(path: Optional[str]) -> str:
 
 
 def run_experiment(config_path: str, dataset_selectors: Optional[List[str]] = None) -> None:
+    """Run the AlphaCast pipeline (or its deterministic fallback) for every
+    dataset in `config_path` (optionally filtered by `dataset_selectors`,
+    matched against each DatasetConfig's name/aliases), printing a Table-1-
+    style MSE/MAE/sMAPE summary at the end."""
     # Load environment from .env if present
     load_dotenv(override=False)
 
@@ -79,6 +101,10 @@ def run_experiment(config_path: str, dataset_selectors: Optional[List[str]] = No
     # logfire.configure()
     # logfire.instrument_pydantic_ai()
 
+    # ORCHESTRATION_MODE=llm (default) builds the full agentic pipeline
+    # (GeneratorAgent + Investigator/Reflector tools, Stages 1-3); any other
+    # value, or a misconfigured/unavailable LLM backbone, leaves `agent` as
+    # None and every dataset below uses deterministic_run_for_dataset.
     mode = os.getenv("ORCHESTRATION_MODE", "llm").lower()
     use_agent = mode == "llm"
 
@@ -105,6 +131,13 @@ def run_experiment(config_path: str, dataset_selectors: Optional[List[str]] = No
         look_back = int(ds.look_back)
         predicted_window = int(ds.predicted_window)
 
+        # Stage-1 precomputation (Sec 3.3-3.5/Appendix A.2/B.2): builds the
+        # sliding-window Case Library (case_base.json), nearest-neighbor
+        # pairs (case_neighbor.json), and K-Medoids clusters (cluster_base.json)
+        # used by prepare_investor_packet's Ycase/Xnb/Ynb computations.
+        # method="weighted" -> cluster_by_kmedoid blends member models'
+        # forecasts by vote count (Eq. 2); num_clusters=6 sets the number of
+        # clusters Cm.
         try:
             analysis = analyze_training(
                 train_df,
@@ -132,6 +165,9 @@ def run_experiment(config_path: str, dataset_selectors: Optional[List[str]] = No
         y = train_df[target_col].to_numpy(dtype=float)
         sel_cfg = getattr(cfg, "feature_selection_override", None)
 
+        # Fsel candidates (Table 5/Appendix A.1/Eq. 1): full target feature
+        # set f(X), persisted to features.json for the agents/deterministic
+        # fallback to select from.
         features = {}
         if getattr(cfg, "use_features", True):
             try:
@@ -185,6 +221,9 @@ def run_experiment(config_path: str, dataset_selectors: Optional[List[str]] = No
             except Exception:
                 pass
 
+        # Xex / E (Sec 3.1, contextual pool): per-exogenous-variable feature
+        # sets, correlations with the target, and the Top-3 selection used
+        # by default as `exogenous_vars` in the investor packet.
         exo_features = {}
         exo_corr = {}
         exo_top3 = []
@@ -233,6 +272,11 @@ def run_experiment(config_path: str, dataset_selectors: Optional[List[str]] = No
             rows.append(deterministic_run_for_dataset(cfg, ds))
             continue
 
+        # The test-set rows beyond the first look_back form the forecast
+        # target; the LLM loop below emits predictions to cover all of
+        # target_df via successive sliding windows of size `predicted_window`
+        # (stride `ds.sliding_window`), mirroring the backtest windows used
+        # by analyze_training/sliding_windows during Stage-1.
         target_df = test_df.iloc[look_back:].reset_index(drop=True)
 
         out_csv = os.path.join(ds_out_dir, "predictions.csv")
@@ -240,6 +284,9 @@ def run_experiment(config_path: str, dataset_selectors: Optional[List[str]] = No
         resume_required = False
 
         if agent is not None:
+            # llm_resume_state.json (runtime.load_resume_state): lets a
+            # long sliding-window backtest pick up mid-dataset after an
+            # interruption instead of restarting from window_offset=0.
             resume_state = load_resume_state(ds_out_dir)
             if resume_state is None and os.path.exists(out_csv):
                 os.remove(out_csv)
@@ -342,10 +389,22 @@ def run_experiment(config_path: str, dataset_selectors: Optional[List[str]] = No
                 llm_failed = False
                 early_stop_due_to_bounds = False
 
+                # One iteration = one sliding-window step of the backtest:
+                # builds a per-step prompt instructing the GeneratorAgent to
+                # run consult -> reason -> record_chain_of_thought ->
+                # emit_predictions (Algorithm 2's GENERATE + the
+                # EVALUATE/UPDATE loop inside emit_predictions), then advances
+                # window_offset by `stride` once predictions are confirmed.
                 while current_collected < total_needed:
                     step_horizon = min(horizon, total_needed - current_collected)
                     window_offset = current_len
 
+                    # Per-step instructions mirroring the GeneratorAgent
+                    # prompt template (Appendix B.8.2 / prompts/generator_agent.md):
+                    # consult once for Icon, reason over reference_prediction
+                    # (Ycase)/neighbors/exogenous trends, log a reflection +
+                    # chain-of-thought, then emit_predictions with the
+                    # Fsel/Xex selections echoed back.
                     prompt_sections: List[str] = []
                     if formatted_brief:
                         prompt_sections.append(formatted_brief)
@@ -386,6 +445,10 @@ def run_experiment(config_path: str, dataset_selectors: Optional[List[str]] = No
                     )
                     prompt = "\n\n".join(prompt_sections)
 
+                    # Retry the whole step on transient network errors (up to
+                    # max_net_failures) or other LLM/tool errors (up to
+                    # max_other_failures); beyond that, persist resume state
+                    # and stop so the user can re-run later.
                     net_failures = 0
                     other_failures = 0
                     while True:
@@ -521,6 +584,8 @@ def run_experiment(config_path: str, dataset_selectors: Optional[List[str]] = No
                         print(
                             f"[warn] Dataset '{ds.name}': predictions file missing 'time_stamp' column during evaluation; attempting best-effort alignment."
                         )
+                    # Score the final Y^ sequence against the held-out test
+                    # split (Table 1 metrics).
                     y_true, y_pred = align_predictions(target_df, pred_df_full, ds.name)
                     rows.append(
                         {
@@ -606,8 +671,12 @@ def run_experiment(config_path: str, dataset_selectors: Optional[List[str]] = No
             continue
 
         if agent is not None and resume_required:
+            # Partial progress was saved; skip this dataset for now rather
+            # than falling back, so a re-run resumes the LLM backtest.
             continue
 
+        # No LLM backbone, or the LLM path didn't complete: fall back to the
+        # training-free "w/o Reasoning" baseline for this dataset.
         rows.append(deterministic_run_for_dataset(cfg, ds))
 
     summary = pd.DataFrame(rows)

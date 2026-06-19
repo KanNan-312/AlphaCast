@@ -1,3 +1,9 @@
+# Top-level entry point for wiring up the multi-agent pipeline. Builds the
+# GeneratorAgent (Stage 2) along with the Investigator (Stage 1) and
+# Reflector (Stage 3) it calls as tools, and provides resume-state
+# persistence so a long sliding-window backtest can pick up where it left
+# off after an interruption (llm_resume_state.json in each dataset's output
+# directory).
 from __future__ import annotations
 
 import json
@@ -6,6 +12,8 @@ from typing import Any, Dict, Optional
 
 from dotenv import load_dotenv
 
+# NOTE: 'castmind' is a stale package name from an earlier project rename
+# (castagent -> castmind -> alphacast); see CLAUDE.md for details.
 from castmind.config import DatasetConfig, ExperimentConfig
 from .common import (
     assess_forecast,
@@ -26,6 +34,9 @@ def resume_state_path(ds_out_dir: str) -> str:
 
 
 def load_resume_state(ds_out_dir: str) -> Optional[dict[str, Any]]:
+    """Load per-dataset progress (e.g. last completed window_offset) so
+    run_experiment.py can resume a sliding-window backtest without
+    re-running already-completed LLM forecasting steps."""
     path = resume_state_path(ds_out_dir)
     if not os.path.exists(path):
         return None
@@ -49,6 +60,8 @@ def save_resume_state(ds_out_dir: str, state: dict[str, Any]) -> None:
 
 
 def clear_resume_state(ds_out_dir: str) -> None:
+    """Remove the resume-state file once a dataset's backtest completes
+    successfully, so the next run starts fresh."""
     path = resume_state_path(ds_out_dir)
     if os.path.exists(path):
         try:
@@ -61,6 +74,12 @@ def build_agent_or_none(
     cfg: ExperimentConfig | None = None,
     dataset_briefings: Optional[Dict[str, str]] = None,
 ):
+    """Construct the GeneratorAgent (Stage 2, paper Sec 3.5) wired to the
+    InvestigatorAgent (Stage 1, Sec 3.4) and ReflectorAgent (Stage 3,
+    Sec 3.6) as callable tools, using the LLM backbone configured via the
+    PYA_MODEL / MODEL environment variables. Returns None if no usable LLM
+    backbone is configured, signaling callers to use the deterministic
+    fallback (deterministic_run_for_dataset) instead."""
     load_dotenv(override=False)
 
     model_name = os.getenv("PYA_MODEL")
@@ -80,7 +99,10 @@ def build_agent_or_none(
         briefing_lookup: Dict[str, str] = dataset_briefings or {}
         dataset_lookup: Dict[str, DatasetConfig] = {d.name: d for d in cfg.datasets} if cfg else {}
 
-        # Build Investigator and Reflector agents (used internally by the generator toolchain)
+        # Build Investigator and Reflector agents (used internally by the generator toolchain).
+        # The Investigator agent instance itself is discarded here -- only its
+        # underlying `prepare_investor_packet`/`consult` tool function (passed
+        # explicitly below) is reused by the Generator.
         _ = create_investigator_agent(
             cfg,
             dataset_lookup,

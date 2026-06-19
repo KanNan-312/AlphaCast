@@ -1,3 +1,7 @@
+# Multi-agent forecasting pipeline (paper Sec 3.2-3.6): Investigator
+# (context preparation), Generator (reasoning-based generation), and
+# Reflector (reflective evaluation/refinement), plus the runtime helpers
+# that wire them together and the deterministic, LLM-free fallback path.
 from .generator_agent import create_generator_agent
 from .investigator_agent import create_investigator_agent
 from .prompts import get_agent_instructions

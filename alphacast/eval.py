@@ -5,8 +5,12 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+# Standard pointwise accuracy metrics (used for both the MSE/MAE results in
+# Table 1 and for scoring candidate models Mi in the case library).
 from .data_loader import TIME_COL, infer_target_column
 
+# Accepted column names for a forecast value across the various prediction
+# CSVs produced by the agents and the deterministic fallback.
 _PREDICTION_COLUMNS = ("predicted_ans", "prediction", "forecast", "value")
 
 
@@ -29,6 +33,11 @@ def align_predictions(
     pred_df: pd.DataFrame,
     dataset_name: Optional[str] = None,
 ) -> tuple[np.ndarray, np.ndarray]:
+    """Match each forecast row in `pred_df` to its ground-truth value in
+    `test_df` by timestamp, returning parallel (y_true, y_pred) arrays ready
+    for mse/mae/smape. Handles the different prediction-file layouts produced
+    by the LLM agents (ordered via `emission_index` or
+    `window_offset`/`horizon_index`) and the deterministic fallback."""
     if TIME_COL not in test_df.columns:
         raise ValueError(f"Ground-truth frame must contain '{TIME_COL}'.")
     if "time_stamp" not in pred_df.columns:

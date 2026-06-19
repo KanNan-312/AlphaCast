@@ -1,3 +1,21 @@
+# GeneratorAgent: Stage 2 of the pipeline (paper Sec 3.5, Algorithm 2's
+# GENERATE step), with its tools also implementing the Stage-3 loop
+# {EVALUATE, UPDATE, GENERATE} via the Reflector. Per forecasting step the
+# LLM is instructed (see prompts/generator_agent.md / Appendix B.8.2) to:
+#   1. consult           -> Stage 1: fetch Icon (the investor packet) via
+#                            prepare_investor_packet.
+#   2. (reason)          -> produce Yint, optionally adjusting the
+#                            reference_prediction (Ycase) baseline.
+#   3. record_chain_of_thought -> persist the reasoning trace, later audited
+#                            by ReflectorAgent.scan_chain_of_thought.
+#   4. emit_predictions  -> finalize Yint, call the Reflector
+#                            (EVALUATE(Icon, Yint)); on rejection this raises
+#                            so the agent loop retries GENERATE with feedback
+#                            (UPDATE), and on approval writes Y^ to
+#                            predictions.csv.
+#
+# NOTE: 'castmind' is a stale package name from an earlier project rename
+# (castagent -> castmind -> alphacast); see CLAUDE.md for details.
 from __future__ import annotations
 
 import json
@@ -14,6 +32,8 @@ from castmind.data_loader import TIME_COL
 from .prompts import get_agent_instructions
 
 
+# Hardcoded fallback instructions used only if prompts/generator_agent.md and
+# the BAML prompts are both unavailable (see prompts.get_agent_instructions).
 GENERATOR_AGENT_PROMPT_FALLBACK = dedent(
     """
     You are GeneratorAgent, a world-class time-series forecasting expert operating in a multi-agent workflow.
@@ -39,6 +59,11 @@ def create_generator_agent(
     reflector_agent: Agent,
     deterministic_run_for_dataset: Callable[[ExperimentConfig, Any], dict],
 ) -> Agent:
+    """Build the GeneratorAgent (Stage 2) and register its four tools:
+    `consult` (Stage 1 context retrieval), `record_chain_of_thought`
+    (reasoning trace), `emit_predictions` (finalize Yint, run Stage-3
+    EVALUATE via the Reflector, and persist Y^), and `run_pipeline` (escape
+    hatch to the deterministic fallback)."""
     instructions = get_agent_instructions("GeneratorAgent", GENERATOR_AGENT_PROMPT_FALLBACK)
     generator_agent = Agent(model_name, instructions=instructions)
     globals()["RunContext"] = RunContext
@@ -70,6 +95,11 @@ def create_generator_agent(
         window_offset: int = 0,
         forecast_horizon: Optional[int] = None,
     ) -> dict:
+        """Stage-1 tool (Sec 3.4): builds and returns Icon -- the
+        consolidated context (Iin, Fsel, K, E, Ycase, Xnb, Ynb) for the
+        requested dataset/window via prepare_investor_packet. The result is
+        cached so emit_predictions can re-use it for the Reflector call
+        without recomputation."""
         ds_cfg = dataset_lookup.get(dataset_name)
         if ds_cfg is None:
             raise ValueError(f"Unknown dataset '{dataset_name}'")
@@ -99,6 +129,10 @@ def create_generator_agent(
         window_offset: int,
         summary: str,
     ) -> dict:
+        """Append the LLM's reasoning trace for this window to
+        chain_of_thought.log and cache it in-memory so emit_predictions can
+        forward it to ReflectorAgent.scan_chain_of_thought for the numeric
+        hallucination/consistency audit."""
         try:
             window_offset_int = int(window_offset)
         except Exception:
@@ -124,6 +158,14 @@ def create_generator_agent(
         exogenous_feature_selection: Optional[dict] = None,
         exogenous_correlations: Optional[dict] = None,
     ) -> dict:
+        """Finalize Yint as the candidate output, run Stage-3 EVALUATE via
+        the Reflector (assess_forecast + scan_chain_of_thought), and on
+        approval persist Y^ to predictions.csv. Also normalizes/auto-fills
+        the LLM-reported Fsel selections (selected_features/feature_weights)
+        and Xex selections (exogenous_vars/exogenous_feature_selection/
+        exogenous_correlations) against the precomputed features.json /
+        exogenous_top3.json so downstream analysis always has consistent
+        metadata even if the LLM omits or mis-specifies them."""
         H = int(predicted_window)
         try:
             window_offset_int = int(window_offset or 0)
@@ -159,6 +201,9 @@ def create_generator_agent(
         elif investor_packet is None:
             investor_packet = {}
 
+        # Stage-3 EVALUATE(Icon, Yint) (Algorithm 2 / Sec 3.6): the Reflector
+        # combines the sanity-check (assess_forecast) with a chain-of-thought
+        # audit (scan_chain_of_thought) and returns {approved, issues, notes}.
         chain_text = chain_cache.get((dataset_name, window_offset_int), "")
         reflection_request = {
             "dataset_name": dataset_name,
@@ -174,6 +219,10 @@ def create_generator_agent(
         except Exception as exc:
             raise RuntimeError(f"ReflectorAgent returned invalid payload: {exc}") from exc
         if not reflection.get("approved", False):
+            # Not approved: surface `issues`/`notes` as feedback fb. Raising
+            # here causes the GeneratorAgent's tool-call loop to retry
+            # GENERATE with this feedback in context (UPDATE(Icon, fb)),
+            # rather than persisting an unapproved Y^.
             issues = reflection.get("issues") or []
             notes = reflection.get("notes") or ""
             joined = ", ".join(str(item) for item in issues)
@@ -424,6 +473,9 @@ def create_generator_agent(
         else:
             start_sequence = 0
 
+        # Approved Y^ for this window, appended to predictions.csv with the
+        # bookkeeping columns (window_offset/horizon_index/emission_index)
+        # that eval.align_predictions uses to match rows to ground truth.
         new_chunk = pd.DataFrame(
             {
                 "time_stamp": pd.to_datetime(timestamps),
@@ -495,6 +547,11 @@ def create_generator_agent(
         output_dir: str,
         dataset_name: str,
     ) -> dict:
+        """Escape hatch that bypasses the LLM reasoning/reflection loop
+        entirely and runs the deterministic, similarity-only fallback
+        (deterministic_run_for_dataset) for an arbitrary dataset, building a
+        throwaway DatasetConfig-like object if `dataset_name` isn't in
+        `dataset_lookup`."""
         ds_obj = dataset_lookup.get(dataset_name)
         if ds_obj is None:
             class _Ds:

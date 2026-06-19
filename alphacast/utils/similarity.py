@@ -1,3 +1,8 @@
+# Similarity metrics used by the Case Library / retrieval toolkit (paper
+# Sec 3.3-3.4): finding the nearest cluster center cm to the current
+# look-back window Xen (case-based prediction Ycase), and finding the
+# nearest neighbor window Xnb with its prediction Ynb for distribution-shift
+# adjustment in the Generator (Sec 3.5).
 from __future__ import annotations
 
 from typing import List, Tuple
@@ -7,6 +12,8 @@ from ..utils.time import ClusterEntry
 
 
 def zscore(x: np.ndarray) -> np.ndarray:
+    """Standardize a series to zero mean / unit variance so shape can be
+    compared independently of scale (used before shape/DTW comparisons)."""
     mu = np.mean(x)
     sigma = np.std(x)
     if sigma == 0:
@@ -23,7 +30,11 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / denom)
 
 def euclidean_distance(a: np.ndarray, b: np.ndarray) -> float:
-    """Compute the Euclidean distance between two vectors."""
+    """Compute the Euclidean distance between two vectors.
+
+    Used to locate the nearest cluster center cm to the input Xen, as
+    described in paper Sec 3.4 ("The nearest cluster center cm to the input
+    Xen is then determined using Euclidean distance")."""
     a = a.astype(float)
     b = b.astype(float)
     return float(np.linalg.norm(a - b))
@@ -127,8 +138,13 @@ def pattern_similarity(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def comprehensive_similarity(query: np.ndarray, candidate: np.ndarray) -> float:
-    """Composite similarity metric that combines several time-series features."""
-    
+    """Composite similarity metric that combines several time-series features.
+
+    Blends shape (cosine), DTW, trend, volatility, and autocorrelation-pattern
+    similarity into a single score in roughly [0, 1]. This is the metric used
+    to rank candidate look-back windows when retrieving the nearest neighbor
+    (Xnb, Ynb) for the Generator's distribution-shift adjustment (Sec 3.5)."""
+
     # Standardize the input series
     query_norm = zscore(query)
     candidate_norm = zscore(candidate)
@@ -173,6 +189,10 @@ def top1_most_similar(query: np.ndarray, candidates: List[Tuple[np.ndarray, str]
     """
     Enhanced model selection that uses the composite similarity metric,
     combining shape, trend, volatility, and pattern features.
+
+    `candidates` pairs each case-library window with the candidate model Mi
+    that performed best on it; the returned model name is used to select the
+    case-based prediction Ycase for the current window (Sec 3.4, Eq. 2).
     """
     if len(candidates) == 0:
         return "SeasonalNaive", 0.0
@@ -209,6 +229,10 @@ def top1_most_similar(query: np.ndarray, candidates: List[Tuple[np.ndarray, str]
 def top1_most_similar_neighbor(query: np.ndarray, candidates: List[Tuple[np.ndarray, np.ndarray]]) -> Tuple[np.ndarray, np.ndarray]:
     """
     Enhanced neighbor selection that relies on the composite similarity metric.
+
+    Returns the (look-back window, prediction) pair Xnb, Ynb of the most
+    similar historical case, used by the Generator to adjust for scale and
+    fluctuation differences between Xnb and the current window Xen (Sec 3.5).
     """
     if len(candidates) == 0:
         return query, query  # Return the query as a default
@@ -242,6 +266,8 @@ def top1_most_similar_neighbor(query: np.ndarray, candidates: List[Tuple[np.ndar
     return best_lookback, best_pred
 
 def top1_most_similar_cluster(query: np.ndarray, candidates: List[ClusterEntry]) -> ClusterEntry:
+    """Pick the cluster Cm whose center cm is closest to `query` (Xen) by
+    Euclidean distance (Sec 3.4); its member models vote on Ycase."""
     best_cluster = None
     best_sim = -1.0
     for cluster in candidates:

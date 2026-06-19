@@ -1,3 +1,9 @@
+# Configuration schema for AlphaCast experiments, loaded from a YAML file
+# (see configs/*.yaml). Each DatasetConfig describes one benchmark series
+# (e.g. ETTh, BE, Windy Power) using the notation from the paper:
+#   look_back        -> H, the length of the endogenous look-back window Xen
+#   predicted_window -> L, the forecast horizon
+#   sliding_window   -> step size used when backtesting across the test set
 import os
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict
@@ -14,7 +20,11 @@ class DatasetConfig:
     sliding_window: int
     frequency: Optional[str] = None
     aliases: List[str] = field(default_factory=list)
+    # Pretrained checkpoint paths for deep-learning / foundation candidate
+    # models (the case-library pool M, see paper Sec 3.3 "Case Library").
     checkpoints: Dict[str, str] = field(default_factory=dict)
+    # Optional dataset-specific text injected into the contextual pool S
+    # (e.g. holiday calendars, domain notes) for the Investigator stage.
     context_prompt_file: Optional[str] = None
 
     def all_aliases(self) -> List[str]:
@@ -28,9 +38,12 @@ class ExperimentConfig:
     datasets: List[DatasetConfig]
     output_dir: str = "outputs"
     # New optional fields
+    # Whether Stage-1 (Investigator) extracts and selects temporal features
+    # Fsel from the feature set F (paper Sec 3.3 "Feature Set").
     use_features: bool = True
     feature_selection_override: Optional[Dict] = None
-    # Exogenous variable processing switch
+    # Whether exogenous variables Xex are extracted/used as part of Iin and
+    # the contextual pool (paper Sec 3.1/3.4).
     use_exogenous: bool = False
     sel_model: Optional[str] = None
 

@@ -1,3 +1,22 @@
+# The candidate model pool M referenced throughout the paper (Sec 3.3,
+# Appendix B.2/Table 4): each ForecastModel subclass below is one Mi, used
+# to (a) precompute the Case Library by pairing each historical look-back
+# window Xi with the best-performing Mi (tools/analysis.evaluate_models_on_window),
+# (b) produce Ycase = weighted average of cluster member models' Mi(Xen)
+# (Eq. 2, tools/forecast.forecast_with_model), and (c) serve as the chosen
+# model in the deterministic "w/o Reasoning" fallback
+# (agents.common.deterministic_run_for_dataset).
+#
+# Models span classical statistical baselines (SeasonalNaive,
+# HistoricAverage, AutoARIMA, HoltWinters, Theta/DynamicOptimizedTheta,
+# AutoCES, CrostonClassic, ZeroModel, Prophet), deep-learning forecasters
+# from alphacast/DeepLearningModels (Autoformer, DLinear, PatchTST, TimesNet,
+# iTransformer), and foundation/zero-shot models (TimesFM, Chronos, Sundial).
+# get_default_models() at the bottom returns the active pool; some entries
+# are commented out to control which models participate in a given run.
+# configure_deep_learning_runtime() lets a dataset's `checkpoints` config
+# (alphacast/config.py) point deep-learning/foundation models at
+# pretrained weights and override their prediction length.
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -80,6 +99,8 @@ def _resolve_pred_len(default: int) -> int:
     return int(ctx.pred_len)
 
 class ForecastModel(Protocol):
+    """Common interface for every candidate model Mi in the pool M: fit on a
+    look-back window y (= Xen) and produce an h-step-ahead forecast (= Mi(Xen))."""
     alias: str
 
     def fit(self, y: np.ndarray, season_length: Optional[int] = None, **kwargs) -> None: ...
@@ -1799,7 +1820,10 @@ class SundialModel:
         return pred_tokens.detach().cpu().numpy()
     
 def get_default_models() -> List[ForecastModel]:
-    # Maintain three basic models: SeasonalNaive, HistoricAverage, and AutoARIMA
+    """The active candidate pool M for case-library construction and
+    forecasting. Entries can be commented out (e.g. TimesFM/Chronos below)
+    to exclude expensive foundation models from a run without touching the
+    rest of the pipeline."""
     return [
         SeasonalNaiveModel(),
         HistoricAverageModel(),

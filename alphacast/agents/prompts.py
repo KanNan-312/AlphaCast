@@ -1,3 +1,9 @@
+# Loads the system prompts for the three agents that implement the paper's
+# Stage-1/2/3 roles (Investigator, Generator, Reflector -- see
+# prompts/*.md, which are the "code-facing" implementations of the
+# paper-facing templates in Appendix B.8). The BAML file
+# prompts/orchestrator_prompts.baml provides an older/alternate prompt
+# source used as a fallback if the per-agent markdown files are missing.
 from __future__ import annotations
 
 import re
@@ -14,6 +20,7 @@ _BAML_PROMPT_PATTERN = re.compile(
     re.DOTALL,
 )
 
+# Primary prompt source: one Markdown file per agent role.
 _PROMPT_FILES = {
     "GeneratorAgent": PROMPTS_DIR / "generator_agent.md",
     "InvestigatorAgent": PROMPTS_DIR / "investigator_agent.md",
@@ -60,6 +67,11 @@ def _load_baml_prompts() -> dict[str, str]:
 
 
 def get_agent_instructions(name: str, fallback: str) -> str:
+    """Resolve the system prompt for agent `name` (e.g. "GeneratorAgent"),
+    trying in order: the dedicated prompts/<role>.md file, then the BAML
+    orchestrator prompts, then the hardcoded `fallback` string supplied by
+    the agent-creation code in generator_agent.py / investigator_agent.py /
+    reflector_agent.py."""
     try:
         return _load_prompt_file(name)
     except Exception:

@@ -1,3 +1,9 @@
+# Implements the temporal "Feature Set" F from paper Sec 3.3 / Appendix A.1
+# (Table 5): ~20 features covering distributional statistics (mean, std,
+# skew, kurtosis), autocorrelation, spectral complexity, structural
+# heterogeneity (lumpiness, flat spots, crossing points), and seasonal
+# strength. The Investigator selects a relevant subset Fsel from these
+# values for both the endogenous series Xen and each exogenous series Xex.
 from __future__ import annotations
 
 from typing import Dict, Optional, List, Callable, Any
@@ -7,6 +13,9 @@ import pandas as pd
 
 
 def _map_pandas_freq_to_period(freq: Optional[str]) -> int:
+    """Map a pandas frequency string (e.g. 'H', '15T', 'D') to an
+    approximate seasonal period length, used by tsfeatures for
+    seasonality-aware computations like seasonal_strength/season_acf1."""
     if not freq:
         return 1
     f = str(freq).upper()
@@ -31,6 +40,8 @@ def _map_pandas_freq_to_period(freq: Optional[str]) -> int:
 
 
 def _basic_statistics(y: np.ndarray) -> Dict[str, float]:
+    """Moment-based features (basic_count/mean/std/min/max/skew/kurt from
+    Table 5): a global summary of the series' shape and scale."""
     y = np.asarray(y, dtype=float)
     finite = np.isfinite(y)
     if not finite.any():
@@ -70,6 +81,9 @@ def _basic_statistics(y: np.ndarray) -> Dict[str, float]:
 
 
 def _spectral_entropy(y: np.ndarray) -> float:
+    """Shannon entropy of the normalized Welch power spectral density
+    (the `spectral_entropy` feature from Table 5): higher values indicate a
+    more complex/irregular signal, lower values a more regular one."""
     y = np.asarray(y, dtype=float)
     if y.size == 0:
         return float("nan")
@@ -91,7 +105,10 @@ def _spectral_entropy(y: np.ndarray) -> float:
 
 
 def _call_tsfeatures(y: np.ndarray, pandas_freq: Optional[str]) -> Dict[str, float]:
-    # Defer imports and be resilient to missing functions
+    # Compute the remaining Table 5 features (acf1/acf10, diff*_acf1, entropy,
+    # lumpiness, flat_spots, crossing_points, ...) via the `tsfeatures`
+    # package. Defer imports and be resilient to missing functions, since
+    # not every tsfeatures version exposes the same set.
     try:
         import tsfeatures as tsf  # type: ignore
         from tsfeatures import tsfeatures as tsf_main  # type: ignore
@@ -153,7 +170,10 @@ def extract_target_features(y: np.ndarray, pandas_freq: Optional[str] = None) ->
     Compute a comprehensive feature set for a univariate target series using tsfeatures with
     graceful degradation. Only the target variable is processed.
 
-    Returns a flat dict of feature_name -> value.
+    Returns a flat dict of feature_name -> value. This is `f(X)` applied to a
+    single series in the feature-set definition F = {f(X) | f in F, X in
+    {Xen, ..., Xex}} (paper Eq. 1); the same function is reused per-series for
+    exogenous variables in extract_exogenous.py.
     """
     y = np.asarray(y, dtype=float)
     out: Dict[str, float] = {}
