@@ -3,20 +3,20 @@ use_features: True
 use_exogenous: True
 
 datasets:
-  - name: 
+  - name: Agriculture
     aliases: []
-    training_csv: 
-    test_csv: 
-    look_back: 
-    predicted_window:
-    sliding_window:
-    frequency: 
+    training_csv: data/Time-MDD/Agriculture/train.csv
+    test_csv: data/Time-MDD/Agriculture/test.csv
+    look_back: 24
+    predicted_window: 12
+    sliding_window: 2
+    frequency: M
     checkpoints:
-      Autoformer: 
-      DLinear: 
-      iTransformer: 
-      PatchTST: 
-      TimesNet: 
+      Autoformer: checkpoints/Autoformer/Agriculture/model.pth
+      DLinear: checkpoints/DLinear/Agriculture/model.pth
+      iTransformer: checkpoints/iTransformer/Agriculture/model.pth
+      PatchTST: checkpoints/PatchTST/Agriculture/model.pth
+      TimesNet: checkpoints/TimesNet/Agriculture/model.pth
     context_prompt_file: 
 
   

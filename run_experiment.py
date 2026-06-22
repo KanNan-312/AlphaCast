@@ -64,7 +64,7 @@ def run_experiment(config_path: str, dataset_selectors: Optional[List[str]] = No
     # Load environment from .env if present
     load_dotenv(override=False)
 
-    cfg = load_config(config_path)
+    cfg = load_config( )
     os.makedirs(cfg.output_dir, exist_ok=True)
 
     selectors = [s.strip().lower() for s in (dataset_selectors or []) if s]
