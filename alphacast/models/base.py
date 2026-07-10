@@ -48,12 +48,14 @@ from statsforecast.models import (
     DynamicOptimizedTheta as SFDynamicOptimizedTheta,
     ZeroModel as SFZeroModel,
 )
+from ..config import DatasetConfig
 
 
 @dataclass
 class _DeepLearningRuntimeContext:
     checkpoints: Dict[str, str]
     pred_len: Optional[int] = None
+    freq: Optional[str] = None
 
 
 _ACTIVE_DL_CONTEXT: Optional[_DeepLearningRuntimeContext] = None
@@ -62,6 +64,7 @@ _ACTIVE_DL_CONTEXT: Optional[_DeepLearningRuntimeContext] = None
 def configure_deep_learning_runtime(
     checkpoints: Optional[Dict[str, str]],
     pred_len: Optional[int],
+    freq: Optional[str]
 ) -> None:
     """Register dataset-specific resources for deep learning models."""
     global _ACTIVE_DL_CONTEXT
@@ -78,6 +81,7 @@ def configure_deep_learning_runtime(
     _ACTIVE_DL_CONTEXT = _DeepLearningRuntimeContext(
         checkpoints=normalized,
         pred_len=int(pred_len) if pred_len is not None else None,
+        freq=str(freq) if freq is not None else None,
     )
 
 
@@ -97,6 +101,12 @@ def _resolve_pred_len(default: int) -> int:
     if ctx is None or ctx.pred_len is None:
         return int(default)
     return int(ctx.pred_len)
+
+def _resolve_frequency(default: str) -> str:
+    ctx = _active_dl_context()
+    if ctx is None or ctx.freq is None:
+        return str(default)
+    return str(ctx.freq)
 
 class ForecastModel(Protocol):
     """Common interface for every candidate model Mi in the pool M: fit on a
@@ -189,9 +199,10 @@ class AutoformerModel(ForecastModel):
     # === Required: checkpoint path consistent with training ===
     model_path: str = ""
 
-    # Runtime device and decoder history length
+    # # Runtime device and decoder history length
     label_len: int = 48
     timefeat_freq: str = "min"   # Match DLinearModel: encode using minute frequency
+    predicted_window: int = 24
 
     # Runtime cache
     _model: Optional[torch.nn.Module] = None
@@ -204,7 +215,7 @@ class AutoformerModel(ForecastModel):
     def _build_x_mark(self, ts_list) -> torch.Tensor:
         """Generate encoder time features from historical timestamps, matching the DLinearModel format."""
         df = pd.DataFrame({"date": pd.to_datetime(list(ts_list))})
-        stamp = time_features(pd.to_datetime(df["date"].values), freq=self.timefeat_freq)  # [F, L]
+        stamp = time_features(pd.to_datetime(df["date"].values), freq=_resolve_frequency(self.timefeat_freq))  # [F, L]
         stamp = stamp.transpose(1, 0)                                                      # [L, F]
         return torch.from_numpy(np.asarray(stamp)).float().unsqueeze(0)                    # [1, L, F]
 
@@ -230,15 +241,15 @@ class AutoformerModel(ForecastModel):
         # Assemble args to mirror the training configuration (DLinearModel style)
         class Args: ...
         args = Args()
-        data_name = "power"
+        data_name = "any"
         args.task_name = "long_term_forecast"
         args.is_training = 0
         args.model = "Autoformer"
-        args.freq = "t"                 # Keep consistent with the paired DLinearModel configuration
+        args.freq = _resolve_frequency(self.timefeat_freq)              # Keep consistent with the paired DLinearModel configuration
         args.checkpoints = "./checkpoints/"
         args.seq_len = L
-        args.label_len = 48
-        args.pred_len = 24              # The effective horizon is set again inside predict(h)
+        args.label_len = self.label_len
+        args.pred_len = self.predicted_window              # The effective horizon is set again inside predict(h)
         args.seasonal_patterns = "Monthly"
         args.inverse = False
         args.individual = 0
@@ -252,7 +263,7 @@ class AutoformerModel(ForecastModel):
         args.dec_in = 1
         args.c_out = 1
         args.features = "S"
-        args.target = "real_power"
+        args.target = "OT"
 
         # Model core & training hyperparameters (aligned with the provided DLinearModel setup)
         args.d_model = 512
@@ -315,6 +326,7 @@ class AutoformerModel(ForecastModel):
 
         # Instantiate and load weights
         self._model = Autoformer(args).to(self._device)
+
         try:
             state = torch.load(self.model_path, map_location=self._device, weights_only=True)
         except TypeError:
@@ -388,7 +400,7 @@ class DLinearModel(ForecastModel):
     def _build_x_mark(self, ts_list) -> torch.Tensor:
         """Generate encoder time features from historical timestamps; DLinear does not use them but we keep the interface uniform."""
         df = pd.DataFrame({"date": pd.to_datetime(list(ts_list))})
-        stamp = time_features(pd.to_datetime(df["date"].values), freq=self.timefeat_freq)  # [F, L]
+        stamp = time_features(pd.to_datetime(df["date"].values), freq=_resolve_frequency(self.timefeat_freq))  # [F, L]
         stamp = stamp.transpose(1, 0)                                                      # [L, F]
         return torch.from_numpy(np.asarray(stamp)).float().unsqueeze(0)                    # [1, L, F]
 
@@ -486,6 +498,7 @@ class DLinearModel(ForecastModel):
         args.data_path = f"{data_name}.csv"
 
         args.pred_len = _resolve_pred_len(args.pred_len)
+
         self._args = args
 
         runtime_path = _resolve_checkpoint(self.alias)
@@ -562,7 +575,7 @@ class PatchTSTModel(ForecastModel):
     def _build_x_mark(self, ts_list) -> torch.Tensor:
         """Generate encoder time features from history only; do not create future timestamps."""
         df = pd.DataFrame({"date": pd.to_datetime(list(ts_list))})
-        stamp = time_features(pd.to_datetime(df["date"].values), freq=self.timefeat_freq)  # [F, L]
+        stamp = time_features(pd.to_datetime(df["date"].values), freq=_resolve_frequency(self.timefeat_freq))  # [F, L]
         stamp = stamp.transpose(1, 0)                                                      # [L, F]
         return torch.from_numpy(np.asarray(stamp)).float().unsqueeze(0)                    # [1, L, F]
 
@@ -728,7 +741,7 @@ class TimesNetModel(ForecastModel):
     def _build_x_mark(self, ts_list) -> torch.Tensor:
         """Generate encoder time features from history only; do not create future timestamps."""
         df = pd.DataFrame({"date": pd.to_datetime(list(ts_list))})
-        stamp = time_features(pd.to_datetime(df["date"].values), freq=self.timefeat_freq)  # [F, L]
+        stamp = time_features(pd.to_datetime(df["date"].values), freq=_resolve_frequency(self.timefeat_freq))  # [F, L]
         stamp = stamp.transpose(1, 0)                                                      # [L, F]
         return torch.from_numpy(np.asarray(stamp)).float().unsqueeze(0)                    # [1, L, F]
 
@@ -903,7 +916,7 @@ class iTransformerModel(ForecastModel):
 
     def _build_x_mark(self, ts_list) -> torch.Tensor:
         df = pd.DataFrame({"date": pd.to_datetime(list(ts_list))})
-        stamp = time_features(pd.to_datetime(df["date"].values), freq=self.timefeat_freq)  # [F, L]
+        stamp = time_features(pd.to_datetime(df["date"].values), freq=_resolve_frequency(self.timefeat_freq))  # [F, L]
         stamp = stamp.transpose(1, 0)                                                      # [L, F]
         return torch.from_numpy(np.asarray(stamp)).float().unsqueeze(0)                    # [1, L, F]
 
@@ -958,13 +971,13 @@ class iTransformerModel(ForecastModel):
         args.features = "S"
         args.target = "real_power"  # Or your univariate column name (must match training)
 
-        args.d_model = 128
+        args.d_model = 512
         args.n_heads = 8
         args.e_layers = 2
         args.d_layers = 1
-        args.d_ff = 128
+        args.d_ff = 2048
         args.moving_avg = 25
-        args.factor = 3
+        args.factor = 1
         args.distil = True
         args.dropout = 0.1
         args.embed = "timeF"
@@ -1824,6 +1837,7 @@ def get_default_models() -> List[ForecastModel]:
     forecasting. Entries can be commented out (e.g. TimesFM/Chronos below)
     to exclude expensive foundation models from a run without touching the
     rest of the pipeline."""
+
     return [
         SeasonalNaiveModel(),
         HistoricAverageModel(),
@@ -1834,7 +1848,7 @@ def get_default_models() -> List[ForecastModel]:
         AutoformerModel(),
         DLinearModel(),
         PatchTSTModel(),
-        TimesNetModel(),
+        # TimesNetModel(), # TBC comeback later
         iTransformerModel(),
         ProphetModel(),
         HoltWintersModel(),

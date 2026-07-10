@@ -86,6 +86,7 @@ def evaluate_models_on_window(
             if err < best_err:
                 best_err, best_name = err, m.alias
         except Exception as e:
+            # raise(e)
             raise ValueError(f"Error fitting model {m.alias} : {e}")
             continue
     return best_name, best_err
@@ -112,6 +113,7 @@ def analyze_training(
     target_col = infer_target_column(train_df, dataset_name)
     y = train_df[target_col].to_numpy(dtype=float)
     ts_all = pd.to_datetime(train_df[TIME_COL])
+    freq = pd.infer_freq(train_df[TIME_COL]) if len(train_df) > 1 else None
 
     memory: AnalysisMemory = {
         "max": float(np.max(y)) if len(y) else 0.0,
@@ -120,16 +122,18 @@ def analyze_training(
         "variance": float(np.var(y)) if len(y) else 0.0,
         "periodicity_lag": int(estimate_periodicity(y)),
         "series_length": int(len(y)),
-        "frequency": pd.infer_freq(train_df[TIME_COL]) if len(train_df) > 1 else None,
+        "frequency": freq,
     }
 
     if dataset_cfg is not None:
+        # Variables needed during runtime and shared across DL models.
         configure_deep_learning_runtime(
             dataset_cfg.checkpoints,
             dataset_cfg.predicted_window,
+            dataset_cfg.frequency
         )
     else:
-        configure_deep_learning_runtime(None, None)
+        configure_deep_learning_runtime(None, None, None)
 
     models = get_default_models()
     L, H = look_back, predicted_window
@@ -140,8 +144,8 @@ def analyze_training(
     clusters: List[CaseEntry] = []
     
     cases_stats : Dict[str, int] = {}
-    
-    for x, fut, ts_x, ts_fut in sliding_windows(y, ts_all, L, H, step=stride):
+    from tqdm import tqdm
+    for x, fut, ts_x, ts_fut in tqdm(sliding_windows(y, ts_all, L, H, step=stride)):
         if len(x) < L or len(fut) < H: continue
         best_model, _ = evaluate_models_on_window(models, x, fut, ts_x, ts_fut, season_length=memory["periodicity_lag"])
         # Case library entry: z-scored look-back window paired with the
@@ -177,7 +181,7 @@ def analyze_training(
     result = AnalyzeResult(memory=memory, case_base=cases, case_neighbors=cases_neighbors)
 
     # Clear model-specific context after analysis to avoid leaking to other datasets.
-    configure_deep_learning_runtime(None, None)
+    configure_deep_learning_runtime(None, None, None)
     return result
 
 def choose_model_by_similarity(cases: List[CaseEntry], current_window: np.ndarray) -> str:

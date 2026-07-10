@@ -19,7 +19,7 @@ from ..models.base import (
     get_default_models,
 )
 if TYPE_CHECKING:
-    from castmind.config import DatasetConfig
+    from alphacast.config import DatasetConfig
 from ..utils.time import generate_future_timestamps
 
 
@@ -37,7 +37,7 @@ def forecast_with_model(
     `dataset.checkpoints` configures pretrained weights for deep-learning /
     foundation candidate models when applicable."""
     if dataset is not None:
-        configure_deep_learning_runtime(dataset.checkpoints, dataset.predicted_window)
+        configure_deep_learning_runtime(dataset.checkpoints, dataset.predicted_window, dataset.frequency)
 
     models = {m.alias: m for m in get_default_models()}
     if model_name not in models:

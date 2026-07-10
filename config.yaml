@@ -9,14 +9,19 @@ datasets:
     test_csv: data/Time-MDD/Agriculture/test.csv
     look_back: 24
     predicted_window: 12
-    sliding_window: 2
+    sliding_window: 12
     frequency: M
     checkpoints:
-      Autoformer: checkpoints/Autoformer/Agriculture/model.pth
-      DLinear: checkpoints/DLinear/Agriculture/model.pth
-      iTransformer: checkpoints/iTransformer/Agriculture/model.pth
-      PatchTST: checkpoints/PatchTST/Agriculture/model.pth
-      TimesNet: checkpoints/TimesNet/Agriculture/model.pth
+      # Autoformer: checkpoints/Autoformer/Agriculture/model.pth
+      # DLinear: checkpoints/DLinear/Agriculture/model.pth
+      # iTransformer: checkpoints/iTransformer/Agriculture/model.pth
+      # PatchTST: checkpoints/PatchTST/Agriculture/model.pth
+      # TimesNet: checkpoints/TimesNet/Agriculture/model.pth
+      Autoformer: /data/triho/Time_Series_Research/Baselines/Time-Series-Library/checkpoints/long_term_forecast_Agriculture_24_12_Autoformer_TimeMDD_ftS_sl24_ll12_pl12_dm512_nh8_el2_dl1_df2048_expand2_dc4_fc1_ebtimeF_dtTrue_test_0/checkpoint.pth
+      DLinear: /data/triho/Time_Series_Research/Baselines/Time-Series-Library/checkpoints/long_term_forecast_Agriculture_24_12_DLinear_TimeMDD_ftS_sl24_ll12_pl12_dm512_nh8_el2_dl1_df2048_expand2_dc4_fc1_ebtimeF_dtTrue_test_0/checkpoint.pth
+      iTransformer: /data/triho/Time_Series_Research/Baselines/Time-Series-Library/checkpoints/long_term_forecast_Agriculture_24_12_iTransformer_TimeMDD_ftS_sl24_ll12_pl12_dm512_nh8_el2_dl1_df2048_expand2_dc4_fc1_ebtimeF_dtTrue_test_0/checkpoint.pth
+      PatchTST: /data/triho/Time_Series_Research/Baselines/Time-Series-Library/checkpoints/long_term_forecast_Agriculture_24_12_PatchTST_TimeMDD_ftS_sl24_ll12_pl12_dm512_nh8_el2_dl1_df2048_expand2_dc4_fc1_ebtimeF_dtTrue_test_0/checkpoint.pth
+      # TimesNet: checkpoints/TimesNet/Agriculture/model.pth
     context_prompt_file: 
 
   

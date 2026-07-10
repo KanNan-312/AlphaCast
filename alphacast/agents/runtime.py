@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 
 # NOTE: 'castmind' is a stale package name from an earlier project rename
 # (castagent -> castmind -> alphacast); see CLAUDE.md for details.
-from castmind.config import DatasetConfig, ExperimentConfig
+from alphacast.config import DatasetConfig, ExperimentConfig
 from .common import (
     assess_forecast,
     deterministic_run_for_dataset,
@@ -88,6 +88,7 @@ def build_agent_or_none(
         if model_raw:
             model_name = f"openai:{model_raw}"
 
+    # CHANGE THIS CODE IF WE SWITCH TO ANTHROPIC / OPENROUTER
     openai_base_url = os.getenv("OPENAI_BASE_URL")
     if openai_base_url and not os.getenv("OPENAI_API_BASE"):
         os.environ["OPENAI_API_BASE"] = openai_base_url

@@ -38,7 +38,8 @@ from alphacast.agents.runtime import (
 from alphacast.eval import align_predictions, mae, mse, smape
 from alphacast.tools.analysis import analyze_training
 from alphacast.features import extract_target_features, extract_exogenous_features
-
+import warnings
+warnings.filterwarnings("ignore")
 
 def _load_dataset_brief(path: Optional[str]) -> str:
     """Read a dataset's context_prompt_file (part of the contextual pool S,
@@ -64,7 +65,7 @@ def run_experiment(config_path: str, dataset_selectors: Optional[List[str]] = No
     # Load environment from .env if present
     load_dotenv(override=False)
 
-    cfg = load_config( )
+    cfg = load_config(config_path)
     os.makedirs(cfg.output_dir, exist_ok=True)
 
     selectors = [s.strip().lower() for s in (dataset_selectors or []) if s]
